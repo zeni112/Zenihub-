@@ -1,0 +1,480 @@
+--============================================================
+--  FLY (плавный, Homelander-style) + ESP + МЕНЮ
+--  F — вкл/выкл полёт
+--  WASD — движение, Space/Ctrl — вверх/вниз, Shift — буст x2
+--============================================================
+
+local Players    = game:GetService("Players")
+local UIS        = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+
+local player     = Players.LocalPlayer
+local playerGui  = player:WaitForChild("PlayerGui")
+
+--============================================================
+--  НАСТРОЙКИ
+--============================================================
+local FLY_SPEED         = 100
+local FLY_ACCEL         = 10
+local BOOST_MULT        = 2
+local ESP_ON            = true
+local ESP_FILL_COLOR    = Color3.fromRGB(255, 60, 60)
+local ESP_OUTLINE_COLOR = Color3.fromRGB(255, 255, 255)
+
+-- ВСТАВЬ СВОИ ID АНИМАЦИЙ (см. инструкцию после скрипта)
+local FLY_ANIM_ID    = "rbxassetid://0"  -- полёт (движение)
+local HOVER_ANIM_ID  = "rbxassetid://0"  -- парение (стоит на месте)
+local WIND_SOUND_ID  = "rbxassetid://3308152153" -- звук ветра (этот рабочий)
+
+-- forward declarations
+local menuFlyBtn, menuEspBtn
+
+--============================================================
+--  ESP
+--============================================================
+local function addHighlight(char)
+    if not ESP_ON then return end
+    if not char or not char:IsA("Model") then return end
+    if char:FindFirstChild("ESPHighlight") then return end
+
+    local h = Instance.new("Highlight")
+    h.Name                = "ESPHighlight"
+    h.FillColor           = ESP_FILL_COLOR
+    h.OutlineColor        = ESP_OUTLINE_COLOR
+    h.FillTransparency    = 0.5
+    h.OutlineTransparency = 0
+    h.DepthMode           = Enum.HighlightDepthMode.AlwaysOnTop
+    h.Parent              = char
+end
+
+local function removeAllHighlights()
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= player and p.Character then
+            local h = p.Character:FindFirstChild("ESPHighlight")
+            if h then h:Destroy() end
+        end
+    end
+end
+
+local function hookPlayer(p)
+    if p == player then return end
+    if p.Character then addHighlight(p.Character) end
+    p.CharacterAdded:Connect(addHighlight)
+end
+
+for _, p in ipairs(Players:GetPlayers()) do hookPlayer(p) end
+Players.PlayerAdded:Connect(hookPlayer)
+
+local function setESP(state)
+    ESP_ON = state
+    if ESP_ON then
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= player and p.Character then addHighlight(p.Character) end
+        end
+    else
+        removeAllHighlights()
+    end
+end
+
+--============================================================
+--  FLY
+--============================================================
+local flying, hrp, humanoid, att, lv, vf, spin, connFly
+local currentVel = Vector3.zero
+local flyAnimTrack, hoverAnimTrack, windSound
+local isMoving = false
+local loadedAnimator = nil
+
+local function loadAnimations()
+    local char = player.Character
+    if not char then return end
+    local animator = char:FindFirstChildOfClass("Animator")
+    if not animator then
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if hum then
+            animator = hum:FindFirstChildOfClass("Animator")
+            if not animator then
+                animator = Instance.new("Animator")
+                animator.Parent = hum
+            end
+        end
+    end
+    if not animator then return end
+    loadedAnimator = animator
+
+    local flyAnim = Instance.new("Animation")
+    flyAnim.AnimationId = FLY_ANIM_ID
+    flyAnimTrack = animator:LoadAnimation(flyAnim)
+    flyAnimTrack.Priority = Enum.AnimationPriority.Action
+
+    local hoverAnim = Instance.new("Animation")
+    hoverAnim.AnimationId = HOVER_ANIM_ID
+    hoverAnimTrack = animator:LoadAnimation(hoverAnim)
+    hoverAnimTrack.Priority = Enum.AnimationPriority.Action
+
+    if windSound then windSound:Destroy() end
+    windSound = Instance.new("Sound")
+    windSound.SoundId = WIND_SOUND_ID
+    windSound.Looped = true
+    windSound.Volume = 0.5
+    windSound.Parent = hrp
+end
+
+local function stopFly()
+    flying = false
+    if connFly then connFly:Disconnect() connFly = nil end
+    if lv  then lv:Destroy()  lv  = nil end
+    if vf  then vf:Destroy()  vf  = nil end
+    if spin then spin:Destroy() spin = nil end
+    if att then att:Destroy() att = nil end
+
+    if flyAnimTrack then flyAnimTrack:Stop() flyAnimTrack = nil end
+    if hoverAnimTrack then hoverAnimTrack:Stop() hoverAnimTrack = nil end
+    if windSound then windSound:Stop() windSound:Destroy() windSound = nil end
+
+    if humanoid and humanoid.Parent then
+        humanoid.PlatformStand = false
+        humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+    end
+
+    hrp, humanoid = nil, nil
+    currentVel = Vector3.zero
+    isMoving = false
+end
+
+local function startFly()
+    local char = player.Character
+    if not char then return end
+    hrp      = char:FindFirstChild("HumanoidRootPart")
+    humanoid = char:FindFirstChildOfClass("Humanoid")
+    if not hrp or not humanoid then return end
+
+    humanoid.PlatformStand = true
+    humanoid:ChangeState(Enum.HumanoidStateType.Physics)
+
+    att = Instance.new("Attachment")
+    att.Parent = hrp
+
+    vf = Instance.new("VectorForce")
+    vf.Attachment0 = att
+    vf.RelativeTo  = Enum.ActuatorRelativeTo.World
+    vf.Force       = Vector3.new(0, workspace.Gravity * hrp.AssemblyMass, 0)
+    vf.Parent      = hrp
+
+    lv = Instance.new("LinearVelocity")
+    lv.Attachment0 = att
+    lv.MaxForce    = math.huge
+    lv.RelativeTo  = Enum.ActuatorRelativeTo.World
+    lv.VectorVelocity = Vector3.zero
+    lv.Parent = hrp
+
+    spin = Instance.new("AlignOrientation")
+    spin.Attachment0    = att
+    spin.Mode           = Enum.OrientationAlignmentMode.OneAttachment
+    spin.MaxTorque      = math.huge
+    spin.Responsiveness = 20
+    spin.Parent         = hrp
+
+    currentVel = Vector3.zero
+    isMoving = false
+
+    loadAnimations()
+
+    if hoverAnimTrack then
+        pcall(function() hoverAnimTrack:Play(0.2) end)
+    end
+
+    connFly = RunService.RenderStepped:Connect(function(dt)
+        if not flying or not hrp or not hrp.Parent or not lv then return end
+        local cam = workspace.CurrentCamera
+        if not cam then return end
+
+        local look  = cam.CFrame.LookVector
+        local right = cam.CFrame.RightVector
+
+        local move = Vector3.zero
+        if UIS:IsKeyDown(Enum.KeyCode.W) then move += look  end
+        if UIS:IsKeyDown(Enum.KeyCode.S) then move -= look  end
+        if UIS:IsKeyDown(Enum.KeyCode.D) then move += right end
+        if UIS:IsKeyDown(Enum.KeyCode.A) then move -= right end
+        if UIS:IsKeyDown(Enum.KeyCode.Space)       then move += Vector3.new(0, 1, 0) end
+        if UIS:IsKeyDown(Enum.KeyCode.LeftControl) then move -= Vector3.new(0, 1, 0) end
+
+        if move.Magnitude > 0 then move = move.Unit end
+
+        local movingNow = move.Magnitude > 0
+        if movingNow ~= isMoving then
+            isMoving = movingNow
+            if isMoving then
+                if hoverAnimTrack then pcall(function() hoverAnimTrack:Stop(0.2) end) end
+                if flyAnimTrack and not flyAnimTrack.IsPlaying then
+                    pcall(function() flyAnimTrack:Play(0.2) end)
+                end
+            else
+                if flyAnimTrack then pcall(function() flyAnimTrack:Stop(0.2) end) end
+                if hoverAnimTrack and not hoverAnimTrack.IsPlaying then
+                    pcall(function() hoverAnimTrack:Play(0.2) end)
+                end
+            end
+        end
+
+        if windSound then
+            if movingNow and not windSound.IsPlaying then
+                windSound:Play()
+            elseif not movingNow and windSound.IsPlaying then
+                windSound:Stop()
+            end
+        end
+
+        local speed = FLY_SPEED
+        if UIS:IsKeyDown(Enum.KeyCode.LeftShift)
+        or UIS:IsKeyDown(Enum.KeyCode.RightShift) then
+            speed *= BOOST_MULT
+        end
+
+        local targetVel = move * speed
+        currentVel = currentVel:Lerp(targetVel, math.clamp(FLY_ACCEL * dt, 0, 1))
+        lv.VectorVelocity = currentVel
+
+        spin.CFrame = CFrame.new(hrp.Position, hrp.Position + look)
+    end)
+end
+
+local COLOR_ON  = Color3.fromRGB(60, 180, 90)
+local COLOR_OFF = Color3.fromRGB(55, 55, 60)
+
+local function updateFlyUI()
+    if not menuFlyBtn then return end
+    menuFlyBtn.Text = flying and "Fly: ON" or "Fly: OFF"
+    menuFlyBtn.BackgroundColor3 = flying and COLOR_ON or COLOR_OFF
+end
+
+local function updateEspUI()
+    if not menuEspBtn then return end
+    menuEspBtn.Text = ESP_ON and "ESP: ON" or "ESP: OFF"
+    menuEspBtn.BackgroundColor3 = ESP_ON and COLOR_ON or COLOR_OFF
+end
+
+local function setFly(state)
+    if state == flying then return end
+    if state then
+        flying = true
+        startFly()
+    else
+        stopFly()
+    end
+    updateFlyUI()
+end
+
+UIS.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == Enum.KeyCode.F then
+        setFly(not flying)
+    end
+end)
+
+player.CharacterAdded:Connect(function()
+    if flying then setFly(false) end
+end)
+
+--============================================================
+--  МЕНЮ
+--============================================================
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "FlyEspMenu"
+screenGui.ResetOnSpawn = false
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+screenGui.Parent = playerGui
+
+local toggleBtn = Instance.new("TextButton")
+toggleBtn.Size = UDim2.new(0, 96, 0, 32)
+toggleBtn.Position = UDim2.new(1, -116, 0, 20)
+toggleBtn.BackgroundColor3 = Color3.fromRGB(28, 28, 32)
+toggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+toggleBtn.Font = Enum.Font.GothamBold
+toggleBtn.TextSize = 14
+toggleBtn.Text = "⚙ Меню"
+toggleBtn.Parent = screenGui
+Instance.new("UICorner", toggleBtn).CornerRadius = UDim.new(0, 8)
+local toggleStroke = Instance.new("UIStroke")
+toggleStroke.Color = Color3.fromRGB(70, 70, 80)
+toggleStroke.Thickness = 1
+toggleStroke.Parent = toggleBtn
+
+local panel = Instance.new("Frame")
+panel.Size = UDim2.new(0, 240, 0, 260)
+panel.Position = UDim2.new(1, -260, 0, 64)
+panel.BackgroundColor3 = Color3.fromRGB(22, 22, 26)
+panel.BorderSizePixel = 0
+panel.Visible = false
+panel.Active = true
+panel.Parent = screenGui
+Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 10)
+local panelStroke = Instance.new("UIStroke")
+panelStroke.Color = Color3.fromRGB(70, 70, 80)
+panelStroke.Thickness = 1
+panelStroke.Parent = panel
+
+local header = Instance.new("Frame")
+header.Size = UDim2.new(1, 0, 0, 34)
+header.BackgroundColor3 = Color3.fromRGB(32, 32, 38)
+header.BorderSizePixel = 0
+header.Parent = panel
+Instance.new("UICorner", header).CornerRadius = UDim.new(0, 10)
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -40, 1, 0)
+title.Position = UDim2.new(0, 12, 0, 0)
+title.BackgroundTransparency = 1
+title.TextColor3 = Color3.fromRGB(255, 255, 255)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 15
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Text = "Zeni HUB"
+title.Parent = header
+
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size = UDim2.new(0, 24, 0, 24)
+closeBtn.Position = UDim2.new(1, -30, 0, 5)
+closeBtn.BackgroundColor3 = Color3.fromRGB(60, 40, 40)
+closeBtn.TextColor3 = Color3.fromRGB(255, 200, 200)
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.TextSize = 14
+closeBtn.Text = "✕"
+closeBtn.Parent = header
+Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 6)
+
+menuFlyBtn = Instance.new("TextButton")
+menuFlyBtn.Size = UDim2.new(1, -20, 0, 36)
+menuFlyBtn.Position = UDim2.new(0, 10, 0, 46)
+menuFlyBtn.BackgroundColor3 = COLOR_OFF
+menuFlyBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+menuFlyBtn.Font = Enum.Font.GothamMedium
+menuFlyBtn.TextSize = 14
+menuFlyBtn.Text = "Fly: OFF"
+menuFlyBtn.Parent = panel
+Instance.new("UICorner", menuFlyBtn).CornerRadius = UDim.new(0, 8)
+
+menuEspBtn = Instance.new("TextButton")
+menuEspBtn.Size = UDim2.new(1, -20, 0, 36)
+menuEspBtn.Position = UDim2.new(0, 10, 0, 88)
+menuEspBtn.BackgroundColor3 = COLOR_OFF
+menuEspBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+menuEspBtn.Font = Enum.Font.GothamMedium
+menuEspBtn.TextSize = 14
+menuEspBtn.Text = "ESP: ON"
+menuEspBtn.Parent = panel
+Instance.new("UICorner", menuEspBtn).CornerRadius = UDim.new(0, 8)
+
+local speedLbl = Instance.new("TextLabel")
+speedLbl.Size = UDim2.new(1, -20, 0, 20)
+speedLbl.Position = UDim2.new(0, 10, 0, 136)
+speedLbl.BackgroundTransparency = 1
+speedLbl.TextColor3 = Color3.fromRGB(200, 200, 210)
+speedLbl.Font = Enum.Font.Gotham
+speedLbl.TextSize = 13
+speedLbl.TextXAlignment = Enum.TextXAlignment.Left
+speedLbl.Text = "Скорость: " .. FLY_SPEED
+speedLbl.Parent = panel
+
+local sliderBar = Instance.new("TextButton")
+sliderBar.Size = UDim2.new(1, -20, 0, 20)
+sliderBar.Position = UDim2.new(0, 10, 0, 160)
+sliderBar.BackgroundColor3 = Color3.fromRGB(50, 50, 58)
+sliderBar.Text = ""
+sliderBar.AutoButtonColor = false
+sliderBar.Parent = panel
+Instance.new("UICorner", sliderBar).CornerRadius = UDim.new(0, 10)
+
+local sliderFill = Instance.new("Frame")
+sliderFill.Size = UDim2.new((FLY_SPEED - 10) / 490, 0, 1, 0)
+sliderFill.BackgroundColor3 = Color3.fromRGB(80, 170, 255)
+sliderFill.BorderSizePixel = 0
+sliderFill.Parent = sliderBar
+Instance.new("UICorner", sliderFill).CornerRadius = UDim.new(0, 10)
+
+local hint = Instance.new("TextLabel")
+hint.Size = UDim2.new(1, -20, 0, 40)
+hint.Position = UDim2.new(0, 10, 0, 190)
+hint.BackgroundTransparency = 1
+hint.TextColor3 = Color3.fromRGB(150, 150, 160)
+hint.Font = Enum.Font.Gotham
+hint.TextSize = 11
+hint.TextXAlignment = Enum.TextXAlignment.Left
+hint.TextYAlignment = Enum.TextYAlignment.Top
+hint.TextWrapped = true
+hint.Text = "WASD — движение  |  Space/Ctrl — вверх/вниз\nShift — ускорение  |  F — вкл/выкл Fly"
+hint.Parent = panel
+
+local MIN_SPEED, MAX_SPEED = 10, 500
+local function setSliderFromX(x)
+    local rel = math.clamp((x - sliderBar.AbsolutePosition.X) / sliderBar.AbsoluteSize.X, 0, 1)
+    FLY_SPEED = math.floor(MIN_SPEED + rel * (MAX_SPEED - MIN_SPEED))
+    sliderFill.Size = UDim2.new(rel, 0, 1, 0)
+    speedLbl.Text = "Скорость: " .. FLY_SPEED
+end
+
+local draggingSlider = false
+sliderBar.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+    or input.UserInputType == Enum.UserInputType.Touch then
+        draggingSlider = true
+        setSliderFromX(input.Position.X)
+    end
+end)
+UIS.InputChanged:Connect(function(input)
+    if draggingSlider and (input.UserInputType == Enum.UserInputType.MouseMovement
+    or input.UserInputType == Enum.UserInputType.Touch) then
+        setSliderFromX(input.Position.X)
+    end
+end)
+UIS.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+    or input.UserInputType == Enum.UserInputType.Touch then
+        draggingSlider = false
+    end
+end)
+
+local draggingPanel, dragStart, startPos
+header.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+    or input.UserInputType == Enum.UserInputType.Touch then
+        draggingPanel = true
+        dragStart = input.Position
+        startPos  = panel.Position
+    end
+end)
+UIS.InputChanged:Connect(function(input)
+    if draggingPanel and (input.UserInputType == Enum.UserInputType.MouseMovement
+    or input.UserInputType == Enum.UserInputType.Touch) then
+        local delta = input.Position - dragStart
+        panel.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + delta.X,
+            startPos.Y.Scale, startPos.Y.Offset + delta.Y
+        )
+    end
+end)
+UIS.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+    or input.UserInputType == Enum.UserInputType.Touch then
+        draggingPanel = false
+    end
+end)
+
+toggleBtn.MouseButton1Click:Connect(function()
+    panel.Visible = not panel.Visible
+end)
+closeBtn.MouseButton1Click:Connect(function()
+    panel.Visible = false
+end)
+menuFlyBtn.MouseButton1Click:Connect(function()
+    setFly(not flying)
+end)
+menuEspBtn.MouseButton1Click:Connect(function()
+    setESP(not ESP_ON)
+    updateEspUI()
+end)
+
+setESP(true)
+updateEspUI()
+updateFlyUI()
